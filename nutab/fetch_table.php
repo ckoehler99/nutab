@@ -16,21 +16,25 @@ spielplanverein: true sagt: gesamt-spielplan laden, nicht aktuell
 	alle: alle Spiele anzeigen
 	von, bis: nur Spiele in diesem Zeitraum anzeigen
 aktuell gibt es in nuLiga nicht mehr, ist aus ISS3 übriggeblieben, entfernen
-verein:
 cty: content type (falls der Aufrufer was ganz spezielles braucht)
 jh: JSON header content
+auchak: in die Tabellen ist auch AK Mannschaften normal drin, und nicht am Ende mit AK
 
 Aufruf erfolgt über JSONP
 
 Todo:
 Umstellen von JSONP auf XHR (dann aber mit CORS, damit andere Vereine das auch nutzen koennen)
 Umstellen von Badgerfish auf normals JSON (das ist auch noch aus ISS3 Zeiten da)
-Verwendenn des eingebauten JSON
+Verwenden des eingebauten JSON
 
 */
 error_reporting(E_ALL & ~(E_NOTICE|E_WARNING|E_DEPRECATED));
 error_reporting(E_ALL & ~(E_NOTICE|E_DEPRECATED));
 @ini_set("display_errors", "1");
+
+// zum testen kann der Cache auch mal disabled werden. 
+// Man sollte aber immer mit arbeiten, weil das die Aufbauzeiten der eigenen Seiten verbessert, und die Last auf die nu Server senkt.
+define("DISABLE_CACHE", 0); 
 
 // alle Parameter als global einlesen
 // auch dies kann man mal besser machen, wenn man will
@@ -51,18 +55,21 @@ if (1 and !ini_get('register_globals')) {
 	unset($superglobal);
 	unset($superglobals);
 }
+@ini_set("default_charset","ISO8859-1");
+@ini_set("date.timezone", "Europe/Berlin");
 // damit preg_match_all auch für lange strings geht
-ini_set("pcre.backtrack_limit","2000000");
+@ini_set("pcre.backtrack_limit","8000000");
+
+ob_start(); // damit warnings nicht in das XML kommen
 
 $q = $_SERVER['QUERY_STRING'];
 $q = preg_replace("/callback=.*?&/", "", $q);
 $q = preg_replace("/_=.*?(&|$)/", "", $q);
 //$ref = $_SERVER['HTTP_REFERER'];
-$callback = preg_replace('/[^a-zA-Z0-9$_.]/', "", $_GET["callback"]);
+$callback = preg_replace('/[^a-zA-Z0-9$_.]/', "", array_key_exists("callback", $_GET) ? $_GET["callback"] : "");
 $u = "";
 $r = "";
-$verein = utf8_decode($verein);
-$verein = str_replace("?", "_", $verein);
+$auchak = (int) $auchak;
 
 // debug ausgabe
 if (!function_exists("pp")) {
@@ -88,28 +95,31 @@ function write_log($f) {
  */
 function clear_cache() {
 	$ff = "cache/clear_cache.txt";
-	if (file_exists($ff) && time() < filemtime($ff) + 300) return;
-	touch($ff);
+	if (file_exists($ff) && time() < filemtime($ff) + 300) return 0;
+	$ret = @touch($ff);
+	if ($ret === false) return -1;
 	$d = @opendir("cache");
-	if (!$d) return;
+	if ($d === false) return -2;
 	$tt = time();
-        while (($f = @readdir($d)) !== false) {
-		if ($f == "." || $f == ".." || $f == "nu_state.txt"|| $f == "clear_cache.txt") continue;
+        while (($f = readdir($d)) !== false) {
+		if ($f == "." || $f == ".." || $f == "nu_state.txt" || $f == "clear_cache.txt") continue;
 		$f = "cache/" . $f;
 		if (is_file($f)) {
-			if (@filemtime($f) + 600 < $tt) {
+			if (filemtime($f) + 600 < $tt) {
 				@unlink($f);
 				//write_log($f);
 			}
 		}
 	}	
 	closedir($d);
+	return 1;
 }
 
 function get_cache($u) {
-	clear_cache();
-	$r = 0;
-	//return $r;
+	if (DISABLE_CACHE) return 0;
+	$ret = clear_cache();
+	if ($ret < 0) return $ret;
+	$r = "";
 	preg_match("§.*\?(.*)§is", $u, $u); $u = $u[1];
 	$u = "cache/" . strtolower(preg_replace("§[^A-Za-z0-9]§", "_", $u)) . ".txt";
 	if (file_exists($u) and time() < filemtime($u) + 10*60) {
@@ -119,10 +129,12 @@ function get_cache($u) {
 }
 
 function put_cache($u, $r) {
-	//return;
+	if (DISABLE_CACHE) return;
 	preg_match("§.*\?(.*)§is", $u, $u); $u = $u[1];
 	$u = "cache/" . strtolower(preg_replace("§[^A-Za-z0-9]§", "_", $u)) . ".txt";
-	$fp = fopen($u, "wb"); fwrite($fp, $r); fclose($fp);
+	$fp = fopen($u, "wb"); 
+	if ($fp === false) return;
+	fwrite($fp, $r); fclose($fp);
 	return;
 }
 
@@ -177,26 +189,39 @@ class NuLiga {
 		return $r;
 	}
 }
+
 // replace utf encoding to regular "ascii"
 function rutf($s) {
 	$s = utf8_decode($s);
 	$s = str_replace('&nbsp;', ' ', $s);
 	$s = html_entity_decode($s);
-	$s = preg_replace_callback('~&#x([0-9a-f]+);~i', function() {$x = $m[0]; return "chr(hexdec($x))";}, $s);
-	$s = preg_replace_callback('~&#([0-9]+);~', function() {$x = $m[0]; return "chr($x)";}, $s);
+	$s = preg_replace_callback('~&#x([0-9a-f]+);~i', function($m) {$x = $m[0]; return "chr(hexdec($x))";}, $s);
+	$s = preg_replace_callback('~&#([0-9]+);~', function($m) {$x = $m[0]; return "chr($x)";}, $s);
 	return $s;
 }
 
 // url zu nuliga kann direkt angegenen sein
+$team = "";
 if ($url) {
 	$url = str_replace("https:", "http:", $url);
-	if (preg_match(';^http://(.*?)\.liga\.nu/.*?championship=(.*?)&group=(\d+);i', $url, $x)) {
+	if (preg_match(';^http://(.*?)\.liga\.nu/.*?/nuLiga(.*?)\.woa.*?groupPage\?championship=(.*?)&group=(\d+);i', $url, $x)) {
 		// Tabelle für diese Gruppe
 		$verband = $x[1];
-		$cs = urldecode($x[2]);
-		$gruppe = $x[3];
-		$url = "http://$verband.liga.nu/cgi-bin/WebObjects/nuLigaHBDE.woa/wa/groupPage?championship=".urlencode($cs)."&group=$gruppe";
+		$sportart = $x[2];
+		$cs = urldecode($x[3]);
+		$gruppe = $x[4];
+		$url = "http://$verband.liga.nu/cgi-bin/WebObjects/nuLiga{$sportart}.woa/wa/groupPage?championship=".urlencode($cs)."&group=$gruppe";
+		if ($auchak) $url .= "&displayTyp=gesamt&displayDetail=tableWithIgnoredTeams";
 		//ex($url);die;
+	} else if (preg_match(';^http://(.*?)\.liga\.nu/.*?/nuLiga(.*?)\.woa.*?teamPortrait\?team=(.*?)&championship=(.*?)&group=(\d+);i', $url, $x)) {
+		//http://htv.liga.nu/cgi-bin/WebObjects/nuLigaTENDE.woa/wa/teamPortrait?team=2306425&championship=TB+Mittelhessen+19&group=22
+		// Tabelle für dieses Team (Tennis)
+		$verband = $x[1];
+		$sportart = $x[2];
+		$team = $x[3];
+		$cs = urldecode($x[4]);
+		$gruppe = $x[5];
+		$url = "http://$verband.liga.nu/cgi-bin/WebObjects/nuLiga{$sportart}.woa/wa/teamPortrait?team={$team}&championship=".urlencode($cs)."&group=$gruppe";
 	} else {
 		//print_r("else ".$url);die;
 		$url = "";
@@ -205,9 +230,10 @@ if ($url) {
 	$spielplanverein = 0;
 }
 
+if (!$verband) $verband = "bhv-handball";
+if (!$sportart) $sportart = "HBDE";
 if ($spielplanverein) {
 	$spielplan = 0;
-	if (!$verband) $verband = "bhv-handball";
 	$club = (int) $club;
 	if ($alle) {
 		// automatisch auf aktuelle Saison
@@ -226,37 +252,37 @@ if ($spielplanverein) {
 	}
 	$ss = $s; $ee = $e;
 	if ($s and $e) $s = "&searchTimeRangeFrom=$s&searchTimeRangeTo=$e"; else $s = "";
-	$u = "http://$verband.liga.nu/cgi-bin/WebObjects/nuLigaHBDE.woa/wa/clubMeetings?searchTimeRange=2&searchType=1{$s}&club={$club}&searchMeetings=Suchen";
+	$u = "http://$verband.liga.nu/cgi-bin/WebObjects/nuLiga{$sportart}.woa/wa/clubMeetings?searchTimeRange=2&searchType=1{$s}&club={$club}&searchMeetings=Suchen";
+	//die($u);
 }
 
 if ($u && ($gruppe || $club)) {
 	if ($spielplan) {
-		if ($verband) 
-		$u = "http://$verband.liga.nu/cgi-bin/WebObjects/nuLigaHBDE.woa/wa/groupPage?displayTyp=vorrunde&displayDetail=meetings&championship=".urlencode($cs)."&group=$gruppe";
-		else
-		$u = "http://bhv-handball.liga.nu/cgi-bin/WebObjects/nuLigaHBDE.woa/wa/groupPage?displayTyp=vorrunde&displayDetail=meetings&championship=".urlencode($cs)."&group=$gruppe";
+		if (!$team) $u = "http://$verband.liga.nu/cgi-bin/WebObjects/nuLiga{$sportart}.woa/wa/groupPage?displayTyp=gesamt&displayDetail=meetings&championship=".urlencode($cs)."&group=$gruppe";
 		if ($aktuell) $u .= "&aktuell=1";
 	}
 	// von nuliga lesen
 	$r = get_cache($u);
+	if (is_int($r) && $r < 0) {
+		$r = "<error>Problem auf eigenem Server. Verzeichnis cache/ existiert nicht oder ist nicht schreibbar. Fehlercode $r</error>";
+		goto cache_err;
+	}
 	if (!$r) {
-		$nu = new NuLiga;
 		if ($spielplan) {
-			$r = $nu->get($u, $u);
-			$u2 = str_replace("vorrunde", "rueckrunde", $u);
-			$r .= $nu->get($u2, $u2);
 			$tab = new NuPlan2;
 			$tab->set_base($u);
 			if ($aktuell) $tab->set_aktuell(true);
 		} else {
-			$r = $nu->get($u, $u);
 			if ($spielplanverein) {
 				$tab = new NuPlan;
 				$tab->set_base($u);
 			} else {
 				$tab = new NuTab;
+				$tab->set_base($u);
 			}
 		}
+		$nu = new NuLiga;
+		$r = $nu->get($u, $u);
 		$tab->init($r);
 		$r = $tab->get_xml();
 		put_cache($u, $r);
@@ -277,10 +303,20 @@ if ($u && ($gruppe || $club)) {
 			$r = preg_replace(';^<Spielplan>;', "<Spielplan>\n<von>$s</von><bis>$e</bis>", $r);
 		}
 	}
+	cache_err:
 	//pp($r);die;
 	//$r = file_get_contents($u);
 	//if (!$utf) $r = utf8_decode($r);
 	//print_r(htmlentities($r)); die;
+}
+
+$ob = ob_get_contents(); ob_end_clean();
+if ($ob) {
+	$ob = preg_replace(';<br />;ismU', '', $ob);
+	$ob = preg_replace(";\n\n;ismU", "\n", $ob);
+	$ob = "<pre>$ob</pre>";
+	$ob = htmlentities($ob);
+	$r = "<error>Serverfehler in fetch_table.php $ob</error>";
 }
 
 if (!$r and $spielplanverein) $r = "<error>Keine Spiele im Zeitraum gefunden ($ss-$ee)</error>";
@@ -313,9 +349,9 @@ if ($jn) {
 
 if (!$r or $r == "[]") {
 	if ($jn)
-	$r = '{error: "Keine gueltigen Daten unter dieser Adresse"}';
+	$r = '{"error": "Keine gueltigen Daten unter dieser Adresse"}';
 	else
-	$r = "{error: {\$:\"Keine gueltigen Daten unter dieser Adresse\"}}";
+	$r = '{"error": {"$":"Keine gueltigen Daten unter dieser Adresse"}}';
 	//@unlink("cache/nu_state.txt");
 }
 // set content type
